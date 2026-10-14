@@ -47,25 +47,39 @@ jobs:
           echo "pods    $(pod --version 2>/dev/null || echo 'not installed')"
           echo "ruby    $(ruby -v)"
 
-      # Opens the iOS project so a wrong scheme/workspace name fails here, loudly and cheaply,
-      # rather than 20 minutes into the archive step.
-      - name: Verify Xcode sees the App scheme
-        working-directory: frontend/ios/App
-        run: |
-          set -eo pipefail
-          xcodebuild -list -workspace App.xcworkspace
-          xcodebuild -list -workspace App.xcworkspace | grep -qE '^\s+App$' \
-            || { echo "::error::scheme 'App' not found in App.xcworkspace"; exit 1; }
-
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
 
-      # `VITE_MOBILE=1 vite build` + stage exercise media + `cap sync` (which runs
-      # `pod install` on macOS, pulling in MLKit and the other Capacitor plugins).
+      # `VITE_MOBILE=1 vite build` + stage the exercise media + `cap sync`, which runs
+      # `pod install` on macOS.
+      #
+      # NOTE (v2): this step must come BEFORE the workspace is opened. `cap sync`/`pod install`
+      # is what generates ios/App/App.xcworkspace/contents.xcworkspacedata -- the repository
+      # only ships xcshareddata/, and contents.xcworkspacedata is gitignored. Version 1 of this
+      # workflow ran `xcodebuild -list -workspace App.xcworkspace` here, before this step, and
+      # failed in 16s because the workspace was still an empty shell.
       - name: Build mobile bundle and sync native projects
         working-directory: frontend
-        run: npm run build:mobile
+        run: |
+          set -o pipefail
+          npm run build:mobile 2>&1 | tee "$GITHUB_WORKSPACE/npm-build-mobile.log"
+
+      # Now the workspace is real, so this check is cheap and meaningful: a wrong
+      # scheme/workspace name fails here instead of 20 minutes into the archive.
+      - name: Verify Xcode sees the App scheme
+        working-directory: frontend/ios/App
+        run: |
+          set -eo pipefail
+          test -f App.xcworkspace/contents.xcworkspacedata || {
+            echo "::error::pod install did not generate App.xcworkspace/contents.xcworkspacedata"
+            ls -la App.xcworkspace || true
+            exit 1
+          }
+          xcodebuild -list -workspace App.xcworkspace
+          xcodebuild -list -workspace App.xcworkspace \
+            | grep -qE '^[[:space:]]+App[[:space:]]*$' \
+            || { echo "::error::scheme 'App' not found in App.xcworkspace"; exit 1; }
 
       - name: Read version and build number
         id: ver
@@ -133,11 +147,13 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload xcodebuild log (always, for diagnosing a failed first run)
+      - name: Upload build logs (always, for diagnosing a failed run)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xcodebuild-log
-          path: xcodebuild-archive.log
+          name: build-logs
+          path: |
+            xcodebuild-archive.log
+            npm-build-mobile.log
           if-no-files-found: ignore
           retention-days: 30
