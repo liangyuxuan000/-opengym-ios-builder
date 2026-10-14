@@ -1,0 +1,143 @@
+name: Build unsigned iOS IPA
+
+# Ported from openGym's `build:ios` job in .gitlab-ci.yml, which upstream ships but has
+# never been able to run (GitLab's free tier has no macOS runner). GitHub Actions does.
+#
+# Produces an UNSIGNED .ipa -- no Apple ID, certificate or provisioning profile involved.
+# Sign it yourself with Sideloadly / AltStore on your own device.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Upstream ref to build (branch, tag or commit SHA)'
+        required: false
+        default: 'main'
+      runner_image:
+        description: 'macOS runner image (macos-15 = Xcode 16, macos-14 = Xcode 15)'
+        required: false
+        default: 'macos-15'
+
+permissions:
+  contents: read
+
+jobs:
+  build-ipa:
+    runs-on: ${{ inputs.runner_image }}
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout upstream openGym
+        uses: actions/checkout@v4
+        with:
+          repository: DuarteSantos8/openGym
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Report toolchain versions
+        run: |
+          echo "node    $(node -v)"
+          echo "npm     $(npm -v)"
+          echo "xcode   $(xcodebuild -version | tr '\n' ' ')"
+          echo "pods    $(pod --version 2>/dev/null || echo 'not installed')"
+          echo "ruby    $(ruby -v)"
+
+      # Opens the iOS project so a wrong scheme/workspace name fails here, loudly and cheaply,
+      # rather than 20 minutes into the archive step.
+      - name: Verify Xcode sees the App scheme
+        working-directory: frontend/ios/App
+        run: |
+          set -eo pipefail
+          xcodebuild -list -workspace App.xcworkspace
+          xcodebuild -list -workspace App.xcworkspace | grep -qE '^\s+App$' \
+            || { echo "::error::scheme 'App' not found in App.xcworkspace"; exit 1; }
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      # `VITE_MOBILE=1 vite build` + stage exercise media + `cap sync` (which runs
+      # `pod install` on macOS, pulling in MLKit and the other Capacitor plugins).
+      - name: Build mobile bundle and sync native projects
+        working-directory: frontend
+        run: npm run build:mobile
+
+      - name: Read version and build number
+        id: ver
+        working-directory: frontend
+        run: |
+          set -eo pipefail
+          VER="$(node -p "require('./package.json').version")"
+          # Build number comes from the Android versionCode so both apps count the same way.
+          BUILD="$(sed -n 's/^ *versionCode \([0-9]*\).*/\1/p' android/app/build.gradle | sed -n 1p)"
+          [ -n "$BUILD" ] || { echo "::error::could not read versionCode from android/app/build.gradle"; exit 1; }
+          echo "marketing=$VER" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD"  >> "$GITHUB_OUTPUT"
+          echo "Building openGym $VER (build $BUILD)"
+
+      - name: Archive unsigned .app
+        working-directory: frontend/ios/App
+        run: |
+          set -eo pipefail
+          # Full log kept for the artifact: upstream warns this job has never actually run,
+          # so the first failure will be diagnosed from this file.
+          xcodebuild \
+            -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/build/App.xcarchive" \
+            -derivedDataPath "$PWD/build/DerivedData" \
+            MARKETING_VERSION="${{ steps.ver.outputs.marketing }}" \
+            CURRENT_PROJECT_VERSION="${{ steps.ver.outputs.build }}" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            archive 2>&1 | tee "$GITHUB_WORKSPACE/xcodebuild-archive.log" | tail -60
+          # `set -o pipefail` above means a failing xcodebuild still fails this step,
+          # even though the pipe to tail would otherwise mask its exit code.
+
+      - name: Package .ipa
+        id: ipa
+        run: |
+          set -eo pipefail
+          VER="${{ steps.ver.outputs.marketing }}"
+          APP="frontend/ios/App/build/App.xcarchive/Products/Applications/App.app"
+          [ -d "$APP" ] || { echo "::error::archive produced no App.app at $APP"; exit 1; }
+          # An .ipa is just a zip with the .app under Payload/.
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP" Payload/
+          NAME="openGym-${VER}-unsigned.ipa"
+          zip -qr "$NAME" Payload
+          shasum -a 256 "$NAME" | tee "$NAME.sha256"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          ls -lh "$NAME"
+          # Report what the device will actually be asked to install.
+          echo "--- Info.plist ---"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' Payload/App.app/Info.plist
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Payload/App.app/Info.plist
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' Payload/App.app/Info.plist
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: openGym-unsigned-ipa
+          path: |
+            openGym-*-unsigned.ipa
+            openGym-*-unsigned.ipa.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload xcodebuild log (always, for diagnosing a failed first run)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: xcodebuild-archive.log
+          if-no-files-found: ignore
+          retention-days: 30
